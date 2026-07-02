@@ -1,0 +1,30 @@
+[package]
+name = "thunder"
+description = "Fast search, fuzzy pick, and command fix — unified terminal tool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "thunder"
+path = "src/main.rs"
+
+[[bin]]
+name = "tn"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+ignore.workspace = true
+thunder-core = { path = "../thunder-core" }
+thunder-fix = { path = "../thunder-fix" }
+thunder-index = { path = "../thunder-index" }
+thunder-pick = { path = "../thunder-pick" }
+thunder-search = { path = "../thunder-search" }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"

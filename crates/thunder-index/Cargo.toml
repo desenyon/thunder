@@ -1,0 +1,24 @@
+[package]
+name = "thunder-index"
+description = "Incremental search index and daemon for Thunder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true }
+ignore.workspace = true
+notify.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thunder-core = { path = "../thunder-core" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "thunderd"
+path = "src/bin/thunderd.rs"

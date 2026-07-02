@@ -1,0 +1,13 @@
+[package]
+name = "thunder-core"
+description = "Shared config, paths, and security helpers for Thunder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+dirs.workspace = true
+serde.workspace = true
+toml.workspace = true

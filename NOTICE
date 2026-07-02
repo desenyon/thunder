@@ -1,0 +1,22 @@
+Thunder
+Copyright (c) 2026 Thunder contributors
+
+This project incorporates or integrates with the following open source software:
+
+- ripgrep (https://github.com/BurntSushi/ripgrep)
+  Copyright (c) Andrew Gallant
+  Licensed under the MIT License and Apache License 2.0
+
+- skim (https://github.com/skim-rs/skim)
+  Copyright (c) skim contributors
+  Licensed under the MIT License
+
+- thefuck (https://github.com/nvbn/thefuck)
+  Copyright (c) thefuck contributors
+  Licensed under the MIT License
+
+- fzf (https://github.com/junegunn/fzf) — optional external integration
+  Copyright (c) Junegunn Choi
+  Licensed under the MIT License
+
+See the LICENSE file and third-party crate licenses for additional details.

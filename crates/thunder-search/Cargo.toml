@@ -1,0 +1,16 @@
+[package]
+name = "thunder-search"
+description = "Ripgrep-backed search with interactive picker for Thunder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thunder-core = { path = "../thunder-core" }
+thunder-index = { path = "../thunder-index" }
+thunder-pick = { path = "../thunder-pick" }
+thiserror.workspace = true
