@@ -1,38 +1,32 @@
+mod doctor;
 mod palette;
 
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
-use thunder_core::{load_config, validate_preview_command};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{Shell, generate};
+use thunder_core::{ThunderConfig, load_config, open_in_editor, validate_preview_command};
 use thunder_fix::{FixMode, fix_command};
-use thunder_index::{client_ping, ensure_daemon};
+use thunder_index::{client_reindex, daemon_status, ensure_daemon, stop_daemon};
 use thunder_pick::{PickOptions, pick_stdin, pick_with_backend};
+use thunder_search::files::pick_files;
 use thunder_search::{SearchOptions, search_interactive, search_plain};
 
-use crate::palette::{print_init_script, run_palette, write_default_config};
+use crate::doctor::run_doctor;
+use crate::palette::{print_init_script, run_history, run_palette, write_default_config};
 
 const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\n\nBuilt with ripgrep, skim, and thefuck (see NOTICE)."
 );
 
-/// Fast search, fuzzy pick, and command fix — unified terminal tool.
-///
-/// Short alias binary: `tn` (same as `thunder`).
-/// Short subcommands: `s` `p` `f` `d` `i` `c` and more — see `tn --help`.
 #[derive(Parser)]
-#[command(
-    version = VERSION,
-    propagate_version = true,
-    disable_help_subcommand = true
-)]
+#[command(version = VERSION, propagate_version = true, disable_help_subcommand = true)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
-
-    /// Shortcut: `tn QUERY` runs search interactively.
     #[arg(value_name = "QUERY")]
     query: Vec<String>,
 }
@@ -41,6 +35,7 @@ struct Cli {
 enum ShellKind {
     Zsh,
     Bash,
+    Fish,
 }
 
 impl ShellKind {
@@ -48,13 +43,13 @@ impl ShellKind {
         match self {
             Self::Zsh => "zsh",
             Self::Bash => "bash",
+            Self::Fish => "fish",
         }
     }
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Search file contents (index daemon or ripgrep) and pick from results.
     #[command(visible_aliases = ["s"])]
     Search {
         query: String,
@@ -76,9 +71,11 @@ enum Commands {
         rg: Option<String>,
         #[arg(long)]
         no_daemon: bool,
+        #[arg(long)]
+        json: bool,
+        #[arg(short, long)]
+        open: bool,
     },
-
-    /// Fuzzy-find and select from stdin or arguments.
     #[command(visible_aliases = ["p"])]
     Pick {
         items: Vec<String>,
@@ -91,8 +88,6 @@ enum Commands {
         #[arg(long)]
         preview: Option<String>,
     },
-
-    /// Suggest or apply a fix for the previous shell command.
     #[command(visible_aliases = ["f"])]
     Fix {
         #[arg(short = 'y', long)]
@@ -100,47 +95,65 @@ enum Commands {
         #[arg(long, env = "THUNDER_THEFUCK")]
         thefuck: Option<String>,
     },
-
-    /// Omni palette: history + files + search launcher.
     #[command(visible_aliases = ["pal", "a"])]
-    Palette,
-
-    /// Shell integration and config helpers.
+    Palette {
+        #[arg(long)]
+        execute: bool,
+    },
+    #[command(visible_aliases = ["fl"])]
+    Files {
+        query: Option<String>,
+        #[arg(long)]
+        open: bool,
+    },
+    #[command(visible_aliases = ["h"])]
+    History {
+        query: Option<String>,
+        #[arg(long)]
+        execute: bool,
+    },
     #[command(visible_aliases = ["i"])]
     Init {
         #[arg(value_enum)]
         shell: ShellKind,
     },
-
-    /// Manage the search index daemon.
     #[command(visible_aliases = ["d"])]
     Daemon {
         #[command(subcommand)]
         action: DaemonAction,
     },
-
-    /// Write the default config file.
     #[command(visible_aliases = ["c"])]
     Config {
         #[arg(long)]
         init: bool,
     },
+    #[command(visible_aliases = ["doc"])]
+    Doctor,
+    #[command(visible_aliases = ["cmp"])]
+    Complete {
+        #[arg(value_enum)]
+        shell: ShellKind,
+    },
 }
 
 #[derive(Subcommand)]
 enum DaemonAction {
-    /// Start thunderd for the current directory tree.
     #[command(visible_alias = "st")]
     Start,
-    /// Show daemon status.
     #[command(visible_alias = "ss")]
     Status,
+    #[command(visible_alias = "sp")]
+    Stop,
+    #[command(visible_alias = "rs")]
+    Restart,
+    #[command(visible_alias = "ri")]
+    Reindex,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = load_config();
-    let invoked_as_tn = invoked_as_short_binary();
+    let short = invoked_as_short_binary();
 
     match cli.command {
         Some(Commands::Search {
@@ -154,28 +167,24 @@ fn main() -> Result<()> {
             preview,
             rg,
             no_daemon,
+            json,
+            open,
         }) => {
-            let mut options = SearchOptions::from_config(config);
-            options.paths = paths;
-            options.case_insensitive = ignore_case;
-            options.fixed_strings = fixed_strings;
-            options.rg_path = rg;
-            options.use_fzf = fzf || options.use_fzf;
-            if let Some(preview) = preview {
-                validate_preview_command(&preview)?;
-                options.preview_cmd = Some(preview);
-            }
-            options.pick.multi = multi;
-            options.use_daemon = !no_daemon;
-
-            if no_ui {
-                search_plain(&query, &options)?;
-            } else {
-                let selected = search_interactive(&query, &options)?;
-                for m in selected {
-                    println!("{}", m.path_line());
-                }
-            }
+            run_search_command(
+                &config,
+                query,
+                paths,
+                ignore_case,
+                fixed_strings,
+                no_ui,
+                fzf,
+                multi,
+                preview,
+                rg,
+                no_daemon,
+                json,
+                open,
+            )?;
         }
         Some(Commands::Pick {
             items,
@@ -183,28 +192,7 @@ fn main() -> Result<()> {
             multi,
             query,
             preview,
-        }) => {
-            if let Some(preview) = &preview {
-                validate_preview_command(preview)?;
-            }
-            let options = PickOptions {
-                multi,
-                preview_cmd: preview.or(Some(config.pick.preview.clone())),
-                query,
-                height: config.pick.height.clone(),
-                ..PickOptions::default()
-            };
-
-            let selected = if items.is_empty() {
-                pick_stdin(&options)?
-            } else {
-                pick_with_backend(&items, &options, fzf || config.pick.use_fzf)?
-            };
-
-            for line in selected {
-                println!("{line}");
-            }
-        }
+        }) => run_pick_command(&config, items, fzf, multi, query, preview)?,
         Some(Commands::Fix { apply, thefuck }) => {
             let mode = if apply {
                 FixMode::Apply
@@ -212,52 +200,72 @@ fn main() -> Result<()> {
                 FixMode::Suggest
             };
             let suggestion = fix_command(mode, &config, thefuck.as_deref())?;
-            print_fix_output(&suggestion, apply, invoked_as_tn)?;
+            print_fix_output(&suggestion, apply, short)?;
         }
-        Some(Commands::Palette) => {
+        Some(Commands::Palette { execute }) => {
             let cwd = std::env::current_dir()?;
-            run_palette(&config, &cwd)?;
+            run_palette(&config, &cwd, execute)?;
         }
-        Some(Commands::Init { shell }) => {
-            print_init_script(shell.as_str())?;
-        }
-        Some(Commands::Daemon { action }) => {
-            match action {
-                DaemonAction::Start => {
-                    let cwd = std::env::current_dir()?;
-                    ensure_daemon(cwd, &config)?;
-                    eprintln!("thunderd is running");
-                }
-                DaemonAction::Status => {
-                    if client_ping()? {
-                        eprintln!("thunderd: running");
-                    } else {
-                        eprintln!("thunderd: not running");
-                        std::process::exit(1);
-                    }
+        Some(Commands::Files { query, open }) => {
+            let cwd = std::env::current_dir()?;
+            let pick = PickOptions {
+                height: config.pick.height.clone(),
+                reverse: config.pick.reverse,
+                prompt: "files> ".into(),
+                query: query.clone(),
+                ..PickOptions::default()
+            };
+            let selected = pick_files(&cwd, query.as_deref(), &pick, 1000)?;
+            for file in selected {
+                if open || config.general.open_on_select {
+                    open_in_editor(&config, &file.path, None)?;
+                } else {
+                    println!("{}", file.display);
                 }
             }
         }
+        Some(Commands::History { query, execute }) => {
+            run_history(&config, query.as_deref(), execute)?;
+        }
+        Some(Commands::Init { shell }) => print_init_script(shell.as_str())?,
+        Some(Commands::Daemon { action }) => run_daemon_action(action, &config)?,
         Some(Commands::Config { init }) => {
             if init {
                 write_default_config()?;
             } else {
-                let cmd = if invoked_as_tn { "tn c --init" } else { "thunder config --init" };
+                let cmd = if short { "tn c --init" } else { "thunder config --init" };
                 eprintln!("usage: {cmd}");
             }
         }
+        Some(Commands::Doctor) => {
+            let cwd = std::env::current_dir()?;
+            run_doctor(&config, &cwd)?;
+        }
+        Some(Commands::Complete { shell }) => {
+            print_completions(shell);
+        }
         None if !cli.query.is_empty() => {
             let query = cli.query.join(" ");
-            let options = SearchOptions::from_config(config);
-            let selected = search_interactive(&query, &options)?;
-            for m in selected {
-                println!("{}", m.path_line());
-            }
+            run_search_command(
+                &config,
+                query,
+                vec![],
+                false,
+                false,
+                false,
+                false,
+                false,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )?;
         }
         None => {
             if io::stdin().is_terminal() {
                 let cwd = std::env::current_dir()?;
-                run_palette(&load_config(), &cwd)?;
+                run_palette(&config, &cwd, false)?;
             } else {
                 let options = PickOptions::default();
                 let selected = pick_stdin(&options)?;
@@ -269,6 +277,146 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_search_command(
+    config: &ThunderConfig,
+    query: String,
+    paths: Vec<PathBuf>,
+    ignore_case: bool,
+    fixed_strings: bool,
+    no_ui: bool,
+    fzf: bool,
+    multi: bool,
+    preview: Option<String>,
+    rg: Option<String>,
+    no_daemon: bool,
+    json: bool,
+    open: bool,
+) -> Result<()> {
+    let mut options = SearchOptions::from_config(config.clone());
+    options.paths = paths;
+    options.case_insensitive = ignore_case;
+    options.fixed_strings = fixed_strings;
+    options.rg_path = rg;
+    options.use_fzf = fzf || options.use_fzf;
+    if let Some(preview) = preview {
+        validate_preview_command(&preview)?;
+        options.preview_cmd = Some(preview);
+    }
+    options.pick.multi = multi;
+    options.use_daemon = !no_daemon;
+    options.json_output = json;
+
+    if no_ui {
+        search_plain(&query, &options)?;
+        return Ok(());
+    }
+
+    let selected = search_interactive(&query, &options)?;
+    let cwd = options.cwd.clone();
+    for m in selected {
+        if open || config.general.open_on_select {
+            let path = if m.path.is_absolute() {
+                m.path.clone()
+            } else {
+                cwd.join(&m.path)
+            };
+            open_in_editor(config, &path, Some(m.line_number))?;
+        } else {
+            println!("{}", m.path_line());
+        }
+    }
+    Ok(())
+}
+
+fn run_pick_command(
+    config: &ThunderConfig,
+    items: Vec<String>,
+    fzf: bool,
+    multi: bool,
+    query: Option<String>,
+    preview: Option<String>,
+) -> Result<()> {
+    if let Some(preview) = &preview {
+        validate_preview_command(preview)?;
+    }
+    let options = PickOptions {
+        multi,
+        preview_cmd: preview.or_else(|| options_preview(config)),
+        query,
+        height: config.pick.height.clone(),
+        reverse: config.pick.reverse,
+        prompt: config.pick.prompt.clone(),
+    };
+
+    let selected = if items.is_empty() {
+        pick_stdin(&options)?
+    } else {
+        pick_with_backend(&items, &options, fzf || config.pick.use_fzf)?
+    };
+
+    for line in selected {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn options_preview(config: &ThunderConfig) -> Option<String> {
+    Some(thunder_core::resolve_preview(config))
+}
+
+fn run_daemon_action(action: DaemonAction, config: &ThunderConfig) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let root = cwd.canonicalize().unwrap_or(cwd);
+
+    match action {
+        DaemonAction::Start => {
+            ensure_daemon(root.clone(), config)?;
+            eprintln!("thunderd is running for {}", root.display());
+        }
+        DaemonAction::Status => {
+            let status = daemon_status(&root)?;
+            if status.running {
+                eprintln!(
+                    "thunderd: running ({} lines) — {}",
+                    status.lines_indexed.unwrap_or(0),
+                    root.display()
+                );
+            } else {
+                eprintln!("thunderd: not running for {}", root.display());
+                std::process::exit(1);
+            }
+        }
+        DaemonAction::Stop => {
+            if stop_daemon(&root)? {
+                eprintln!("thunderd: stopped");
+            } else {
+                eprintln!("thunderd: not running");
+            }
+        }
+        DaemonAction::Restart => {
+            stop_daemon(&root)?;
+            ensure_daemon(root.clone(), config)?;
+            eprintln!("thunderd: restarted for {}", root.display());
+        }
+        DaemonAction::Reindex => {
+            let count = client_reindex(&root)?;
+            eprintln!("thunderd: reindexed {count} lines");
+        }
+    }
+    Ok(())
+}
+
+fn print_completions(shell: ShellKind) {
+    let mut cmd = Cli::command();
+    let shell = match shell {
+        ShellKind::Zsh => Shell::Zsh,
+        ShellKind::Bash => Shell::Bash,
+        ShellKind::Fish => Shell::Fish,
+    };
+    generate(shell, &mut cmd, "tn", &mut io::stdout());
 }
 
 fn invoked_as_short_binary() -> bool {
@@ -314,7 +462,7 @@ mod cli_tests {
             .arg("--help")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Fast search"));
+            .stdout(predicate::str::contains("search"));
     }
 
     #[test]

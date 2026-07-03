@@ -16,6 +16,9 @@ serde_json.workspace = true
 thunder-core = { path = "../thunder-core" }
 thiserror.workspace = true
 
+[dependencies.libc]
+version = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 

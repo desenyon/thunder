@@ -18,6 +18,7 @@ repository = "https://github.com/desenyon/thunder"
 [workspace.dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
 dirs = "6"
 ignore = "0.4"
 notify = "8"

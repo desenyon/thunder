@@ -304,6 +304,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_complete"
+version = "4.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db8b397918185f0161ff3d6fcaa9e4bfc09b8367caf6e1d4a2848e5477ed027b"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "clap_derive"
 version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2349,6 +2358,7 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "clap",
+ "clap_complete",
  "ignore",
  "predicates",
  "tempfile",
@@ -2366,6 +2376,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "serde",
+ "tempfile",
  "toml",
 ]
 
@@ -2385,6 +2396,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ignore",
+ "libc",
  "notify",
  "serde",
  "serde_json",
@@ -2408,6 +2420,7 @@ name = "thunder-search"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ignore",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

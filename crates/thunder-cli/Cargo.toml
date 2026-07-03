@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 ignore.workspace = true
 thunder-core = { path = "../thunder-core" }
 thunder-fix = { path = "../thunder-fix" }

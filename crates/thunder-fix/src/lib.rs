@@ -108,6 +108,10 @@ pub fn validate_safe_command(command: &str) -> Result<()> {
         bail!("empty command");
     }
 
+    if trimmed.contains('\n') || trimmed.contains('\r') {
+        bail!("multiline commands are not allowed");
+    }
+
     const BLOCKED: &[&str] = &["rm -rf /", ":(){ :|:& };:", "mkfs", "dd if=", "> /dev/sd"];
     for pattern in BLOCKED {
         if trimmed.contains(pattern) {
@@ -126,6 +130,11 @@ fn enabled_rules(config: &ThunderConfig) -> Vec<Box<dyn FixRule>> {
         Box::new(NpmRule),
         Box::new(DockerRule),
         Box::new(ManRule),
+        Box::new(PythonRule),
+        Box::new(CargoRule),
+        Box::new(PipRule),
+        Box::new(KubectlRule),
+        Box::new(BrewRule),
     ];
 
     if config.fix.enabled_rules.is_empty() {
@@ -162,7 +171,10 @@ impl FixRule for GitTypoRule {
                 rule: self.name().into(),
             })
         } else if ctx.stderr.contains("git: command not found") {
-            None
+            Some(Correction {
+                command: "brew install git".into(),
+                rule: self.name().into(),
+            })
         } else {
             None
         }
@@ -311,6 +323,145 @@ impl FixRule for ManRule {
         let topic = ctx.command.trim_start_matches("man ").trim();
         Some(Correction {
             command: format!("help {topic}"),
+            rule: self.name().into(),
+        })
+    }
+}
+
+struct PythonRule;
+
+impl FixRule for PythonRule {
+    fn name(&self) -> &'static str {
+        "python"
+    }
+
+    fn matches(&self, ctx: &ShellContext) -> bool {
+        ctx.exit_code != 0
+            && (ctx.command.starts_with("pyhton ")
+                || ctx.command.starts_with("pyton ")
+                || ctx.stderr.contains("python: command not found"))
+    }
+
+    fn suggest(&self, ctx: &ShellContext) -> Option<Correction> {
+        if ctx.stderr.contains("python: command not found") {
+            return Some(Correction {
+                command: ctx.command.replacen("python", "python3", 1),
+                rule: self.name().into(),
+            });
+        }
+        let fixed = ctx
+            .command
+            .replacen("pyhton ", "python3 ", 1)
+            .replacen("pyton ", "python3 ", 1);
+        Some(Correction {
+            command: fixed,
+            rule: self.name().into(),
+        })
+    }
+}
+
+struct CargoRule;
+
+impl FixRule for CargoRule {
+    fn name(&self) -> &'static str {
+        "cargo"
+    }
+
+    fn matches(&self, ctx: &ShellContext) -> bool {
+        ctx.exit_code != 0
+            && (ctx.command.starts_with("cago ")
+                || ctx.command.starts_with("crgo ")
+                || ctx.stderr.contains("cargo: command not found"))
+    }
+
+    fn suggest(&self, ctx: &ShellContext) -> Option<Correction> {
+        if ctx.stderr.contains("cargo: command not found") {
+            return Some(Correction {
+                command: "rustup update stable && cargo --version".into(),
+                rule: self.name().into(),
+            });
+        }
+        let fixed = ctx
+            .command
+            .replacen("cago ", "cargo ", 1)
+            .replacen("crgo ", "cargo ", 1);
+        Some(Correction {
+            command: fixed,
+            rule: self.name().into(),
+        })
+    }
+}
+
+struct PipRule;
+
+impl FixRule for PipRule {
+    fn name(&self) -> &'static str {
+        "pip"
+    }
+
+    fn matches(&self, ctx: &ShellContext) -> bool {
+        ctx.exit_code != 0 && (ctx.command.starts_with("pi ") || ctx.command.starts_with("pp "))
+    }
+
+    fn suggest(&self, ctx: &ShellContext) -> Option<Correction> {
+        let fixed = ctx
+            .command
+            .replacen("pi ", "pip3 ", 1)
+            .replacen("pp ", "pip3 ", 1);
+        Some(Correction {
+            command: fixed,
+            rule: self.name().into(),
+        })
+    }
+}
+
+struct KubectlRule;
+
+impl FixRule for KubectlRule {
+    fn name(&self) -> &'static str {
+        "kubectl"
+    }
+
+    fn matches(&self, ctx: &ShellContext) -> bool {
+        ctx.exit_code != 0
+            && (ctx.command.starts_with("kubctl ")
+                || ctx.command.starts_with("kubeclt ")
+                || ctx.command.starts_with("kbectl "))
+    }
+
+    fn suggest(&self, ctx: &ShellContext) -> Option<Correction> {
+        let fixed = ctx
+            .command
+            .replacen("kubctl ", "kubectl ", 1)
+            .replacen("kubeclt ", "kubectl ", 1)
+            .replacen("kbectl ", "kubectl ", 1);
+        Some(Correction {
+            command: fixed,
+            rule: self.name().into(),
+        })
+    }
+}
+
+struct BrewRule;
+
+impl FixRule for BrewRule {
+    fn name(&self) -> &'static str {
+        "brew"
+    }
+
+    fn matches(&self, ctx: &ShellContext) -> bool {
+        ctx.exit_code != 0
+            && (ctx.command.starts_with("bew ")
+                || ctx.command.starts_with("bre "))
+    }
+
+    fn suggest(&self, ctx: &ShellContext) -> Option<Correction> {
+        let fixed = ctx
+            .command
+            .replacen("bew ", "brew ", 1)
+            .replacen("bre ", "brew ", 1);
+        Some(Correction {
+            command: fixed,
             rule: self.name().into(),
         })
     }
