@@ -46,6 +46,30 @@ Thunder replaces the trio of tools you reach for dozens of times a day:
 
 ## Install
 
+### One-line setup (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/desenyon/thunder/main/scripts/install.sh | bash
+```
+
+This will:
+
+1. Install Rust (via rustup) and ripgrep if missing
+2. Clone/update Thunder to `~/.local/share/thunder`
+3. Build and link `tn`, `thunder`, `thunderd` to `~/.local/bin`
+4. Write default config (`tn c --init`)
+5. Add PATH + shell hooks to your `~/.zshrc`, `~/.bashrc`, or fish config
+
+Then activate in your current shell:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+eval "$(tn i zsh)"   # or bash / fish
+tn doc
+```
+
+### Manual install
+
 ```bash
 git clone https://github.com/desenyon/thunder.git
 cd thunder
@@ -54,6 +78,14 @@ cargo build --release
 export PATH="$PWD/target/release:$PATH"
 tn c --init
 eval "$(tn i zsh)"    # add to ~/.zshrc
+```
+
+### Update
+
+Re-run the one-liner — it pulls latest and rebuilds:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/desenyon/thunder/main/scripts/install.sh | bash
 ```
 
 ### Dependencies
