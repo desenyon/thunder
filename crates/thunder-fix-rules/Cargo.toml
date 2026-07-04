@@ -1,6 +1,6 @@
 [package]
-name = "thunder-pick"
-description = "Fuzzy picker for Thunder (skim wrapper)"
+name = "thunder-fix-rules"
+description = "Native correction rules for Thunder"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,7 +8,4 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-serde.workspace = true
-skim.workspace = true
 thunder-core = { path = "../thunder-core" }
-thiserror.workspace = true

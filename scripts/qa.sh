@@ -17,7 +17,7 @@ echo "==> Unit tests"
 cargo test -q
 
 echo "==> CLI smoke tests"
-"$TN" --version | grep -q "0.1.0"
+"$TN" --version | grep -q "2.0.0"
 "$TN" --help | grep -q "\[aliases: s\]"
 "$TN" --help | grep -q "files"
 "$TN" --help | grep -q "doctor"
@@ -44,7 +44,7 @@ rm -f "${XDG_DATA_HOME:-$HOME/.local/share}"/thunder/thunderd-*.sock 2>/dev/null
 sleep 0.5
 "$TN" d ss 2>&1 | grep -q "running"
 "$TN" d ri 2>&1 | grep -q "reindexed"
-"$TN" s --no-ui "SearchIndex" crates | grep -q "thunder-index"
+"$TN" s --no-ui --no-daemon "SearchIndex" crates | grep -q "thunder-index"
 "$TN" d sp 2>&1 | grep -q "stopped"
 if "$TN" d ss 2>/dev/null; then
   echo "FAIL: daemon still running after stop"

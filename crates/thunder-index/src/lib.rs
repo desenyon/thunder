@@ -1,20 +1,30 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::net::Shutdown;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use ignore::WalkBuilder;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use thunder_core::{
-    ThunderConfig, is_safe_relative_path, path_within_root, pid_path_for_root, socket_path_for_root,
+    ThunderConfig, corpus_path_for_root, is_safe_relative_path, path_within_root, pid_path_for_root,
+    socket_path_for_root, tcp_port_path_for_root,
 };
+
+mod store;
+use store::{LineCorpus, LineRef};
+
+#[cfg(unix)]
+use std::net::Shutdown;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexMatch {
@@ -28,8 +38,9 @@ pub struct IndexMatch {
 struct IndexedLine {
     path: String,
     line_number: u64,
-    text: String,
-    lower: String,
+    text_off: u32,
+    text_len: u32,
+    lower_off: u32,
 }
 
 #[derive(Debug)]
@@ -38,21 +49,67 @@ pub struct SearchIndex {
     max_file_size: u64,
     lines: Vec<IndexedLine>,
     trigrams: HashMap<String, Vec<usize>>,
+    file_ranges: HashMap<String, (usize, usize)>,
+    corpus: LineCorpus,
 }
 
 impl SearchIndex {
     pub fn new(root: PathBuf, max_file_size: u64) -> Self {
+        let corpus_path = corpus_path_for_root(&root).unwrap_or_else(|_| {
+            std::env::temp_dir().join("thunder-corpus.bin")
+        });
+        let corpus = LineCorpus::open(corpus_path).unwrap_or_else(|_| {
+            LineCorpus::open(std::env::temp_dir().join("thunder-corpus.bin")).expect("corpus")
+        });
         Self {
             root,
             max_file_size,
             lines: Vec::new(),
             trigrams: HashMap::new(),
+            file_ranges: HashMap::new(),
+            corpus,
         }
+    }
+
+    fn line_text(&self, line: &IndexedLine) -> &str {
+        let reference = LineRef {
+            path: line.path.clone(),
+            line_number: line.line_number,
+            text_off: line.text_off,
+            text_len: line.text_len,
+            lower_off: line.lower_off,
+        };
+        self.corpus.text_at(&reference)
+    }
+
+    fn line_lower(&self, line: &IndexedLine) -> &str {
+        let reference = LineRef {
+            path: line.path.clone(),
+            line_number: line.line_number,
+            text_off: line.text_off,
+            text_len: line.text_len,
+            lower_off: line.lower_off,
+        };
+        self.corpus.lower_at(&reference)
+    }
+
+    pub fn list_files(&self) -> Vec<String> {
+        let mut files: Vec<String> = self.file_ranges.keys().cloned().collect();
+        files.sort_unstable();
+        files
+    }
+
+    pub fn update_paths(&mut self, paths: &[PathBuf]) -> Result<usize> {
+        if paths.is_empty() {
+            return Ok(self.lines.len());
+        }
+        self.build()
     }
 
     pub fn build(&mut self) -> Result<usize> {
         self.lines.clear();
         self.trigrams.clear();
+        self.file_ranges.clear();
 
         let mut walker = WalkBuilder::new(&self.root);
         walker
@@ -60,61 +117,66 @@ impl SearchIndex {
             .git_ignore(true)
             .git_global(false)
             .git_exclude(true);
-        let walker = walker.build();
 
-        for entry in walker {
-            let entry = entry.context("walk failed")?;
-            let path = entry.path();
-            if !entry.file_type().is_some_and(|t| t.is_file()) {
-                continue;
+        let files: Vec<PathBuf> = walker
+            .build()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+            .map(|e| e.into_path())
+            .filter(|path| {
+                let rel = path.strip_prefix(&self.root).unwrap_or(path);
+                is_safe_relative_path(rel)
+                    && fs::metadata(path)
+                        .ok()
+                        .is_none_or(|m| m.len() <= self.max_file_size)
+            })
+            .collect();
+
+        let root = self.root.clone();
+        let max_file_size = self.max_file_size;
+        let parsed: Vec<(String, Vec<(u64, String)>)> = files
+            .par_iter()
+            .filter_map(|path| read_file_lines(&root, path, max_file_size).ok())
+            .collect();
+
+        let corpus_path = corpus_path_for_root(&self.root)?;
+        let mut corpus = LineCorpus::open(corpus_path)?;
+        let mut writer = corpus.reset()?;
+        let mut lower_region = Vec::new();
+
+        for (rel, file_lines) in parsed {
+            let start = self.lines.len();
+            for (line_number, text) in file_lines {
+                let line_ref = LineCorpus::append_line(
+                    &mut writer,
+                    &mut lower_region,
+                    &rel,
+                    line_number,
+                    &text,
+                )?;
+                self.lines.push(IndexedLine {
+                    path: rel.clone(),
+                    line_number: line_ref.line_number,
+                    text_off: line_ref.text_off,
+                    text_len: line_ref.text_len,
+                    lower_off: line_ref.lower_off,
+                });
             }
-            let rel = path.strip_prefix(&self.root).unwrap_or(path);
-            if !is_safe_relative_path(rel) {
-                continue;
+            if start < self.lines.len() {
+                self.file_ranges.insert(rel, (start, self.lines.len()));
             }
-            if fs::metadata(path)
-                .ok()
-                .is_some_and(|m| m.len() > self.max_file_size)
-            {
-                continue;
-            }
-            self.index_file(path)?;
         }
+
+        self.corpus = corpus.finalize(writer, &lower_region)?;
 
         self.rebuild_trigrams();
         Ok(self.lines.len())
     }
 
-    fn index_file(&mut self, path: &Path) -> Result<()> {
-        let rel = path
-            .strip_prefix(&self.root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .to_string();
-
-        let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-        if bytes.iter().any(|&b| b == 0) {
-            return Ok(());
-        }
-
-        let content = String::from_utf8_lossy(&bytes);
-        for (idx, line) in content.lines().enumerate() {
-            let lower = line.to_lowercase();
-            self.lines.push(IndexedLine {
-                path: rel.clone(),
-                line_number: (idx + 1) as u64,
-                text: line.to_string(),
-                lower,
-            });
-        }
-        Ok(())
-    }
-
     fn rebuild_trigrams(&mut self) {
         self.trigrams.clear();
-        for (idx, line) in self.lines.iter_mut().enumerate() {
-            line.lower = line.text.to_lowercase();
-            for tri in trigrams(&line.lower) {
+        for (idx, line) in self.lines.iter().enumerate() {
+            for tri in trigrams(self.line_lower(line)) {
                 self.trigrams.entry(tri).or_default().push(idx);
             }
         }
@@ -140,13 +202,17 @@ impl SearchIndex {
         let mut results = Vec::new();
         for idx in candidate_indices {
             let line = &self.lines[idx];
-            let haystack = if ignore_case { &line.lower } else { &line.text };
+            let haystack = if ignore_case {
+                self.line_lower(line)
+            } else {
+                self.line_text(line)
+            };
             if let Some(pos) = haystack.find(&needle) {
                 results.push(IndexMatch {
                     path: line.path.clone(),
                     line_number: line.line_number,
                     column: (pos + 1) as u64,
-                    line_text: line.text.clone(),
+                    line_text: self.line_text(line).to_string(),
                 });
                 if results.len() >= limit {
                     break;
@@ -193,6 +259,32 @@ impl SearchIndex {
     }
 }
 
+fn read_file_lines(
+    root: &Path,
+    path: &Path,
+    max_file_size: u64,
+) -> Result<(String, Vec<(u64, String)>)> {
+    let rel = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string();
+    if !is_safe_relative_path(Path::new(&rel)) {
+        bail!("unsafe path");
+    }
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    if bytes.len() as u64 > max_file_size || bytes.contains(&0) {
+        bail!("skip file");
+    }
+    let content = String::from_utf8_lossy(&bytes);
+    let lines = content
+        .lines()
+        .enumerate()
+        .map(|(idx, line)| ((idx + 1) as u64, line.to_string()))
+        .collect();
+    Ok((rel, lines))
+}
+
 fn trigrams(text: &str) -> Vec<String> {
     let padded = format!("  {text} ");
     padded
@@ -209,6 +301,7 @@ struct ClientRequest {
     query: Option<String>,
     limit: Option<usize>,
     ignore_case: Option<bool>,
+    prefix: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -216,6 +309,8 @@ struct ClientResponse {
     ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     matches: Option<Vec<IndexMatch>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    files: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     lines_indexed: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -248,6 +343,7 @@ impl DaemonState {
                 return ClientResponse {
                     ok: false,
                     matches: None,
+                    files: None,
                     lines_indexed: None,
                     root: Some(expected.clone()),
                     message: Some(format!("daemon root mismatch: expected {expected}")),
@@ -259,6 +355,7 @@ impl DaemonState {
             "ping" => ClientResponse {
                 ok: true,
                 matches: None,
+                files: None,
                 lines_indexed: Some(self.index.lock().unwrap().line_count()),
                 root: Some(self.root.to_string_lossy().into_owned()),
                 message: Some("pong".into()),
@@ -282,6 +379,26 @@ impl DaemonState {
                 ClientResponse {
                     ok: true,
                     matches: Some(matches),
+                    files: None,
+                    lines_indexed: None,
+                    root: Some(self.root.to_string_lossy().into_owned()),
+                    message: None,
+                }
+            }
+            "list_files" => {
+                let index = self.index.lock().unwrap();
+                let mut files = index.list_files();
+                if let Some(prefix) = &request.prefix {
+                    let p = prefix.to_lowercase();
+                    files.retain(|f| f.to_lowercase().contains(&p));
+                }
+                if let Some(limit) = request.limit {
+                    files.truncate(limit);
+                }
+                ClientResponse {
+                    ok: true,
+                    matches: None,
+                    files: Some(files),
                     lines_indexed: None,
                     root: Some(self.root.to_string_lossy().into_owned()),
                     message: None,
@@ -291,6 +408,7 @@ impl DaemonState {
                 Ok(count) => ClientResponse {
                     ok: true,
                     matches: None,
+                    files: None,
                     lines_indexed: Some(count),
                     root: Some(self.root.to_string_lossy().into_owned()),
                     message: Some("reindexed".into()),
@@ -298,6 +416,7 @@ impl DaemonState {
                 Err(err) => ClientResponse {
                     ok: false,
                     matches: None,
+                    files: None,
                     lines_indexed: None,
                     root: Some(self.root.to_string_lossy().into_owned()),
                     message: Some(err.to_string()),
@@ -306,6 +425,7 @@ impl DaemonState {
             _ => ClientResponse {
                 ok: false,
                 matches: None,
+                files: None,
                 lines_indexed: None,
                 root: Some(self.root.to_string_lossy().into_owned()),
                 message: Some(format!("unknown op: {}", request.op)),
@@ -315,6 +435,14 @@ impl DaemonState {
 }
 
 pub fn run_daemon(root: PathBuf, config: ThunderConfig) -> Result<()> {
+    #[cfg(unix)]
+    return run_daemon_unix(root, config);
+    #[cfg(not(unix))]
+    return run_daemon_tcp(root, config);
+}
+
+#[cfg(unix)]
+fn run_daemon_unix(root: PathBuf, config: ThunderConfig) -> Result<()> {
     let root = root.canonicalize().unwrap_or(root);
     let socket = socket_path_for_root(&root)?;
     let pid_file = pid_path_for_root(&root)?;
@@ -350,6 +478,42 @@ pub fn run_daemon(root: PathBuf, config: ThunderConfig) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(unix))]
+fn run_daemon_tcp(root: PathBuf, config: ThunderConfig) -> Result<()> {
+    use std::net::{TcpListener, TcpStream};
+
+    let root = root.canonicalize().unwrap_or(root);
+    let pid_file = pid_path_for_root(&root)?;
+    let port_file = tcp_port_path_for_root(&root)?;
+
+    let listener = TcpListener::bind("127.0.0.1:0").context("bind tcp")?;
+    let port = listener.local_addr()?.port();
+    if let Some(parent) = port_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&port_file, port.to_string())?;
+    fs::write(&pid_file, std::process::id().to_string())?;
+
+    let state = Arc::new(DaemonState::new(root.clone(), config.clone())?);
+    spawn_watcher(state.clone(), root.clone())?;
+
+    eprintln!(
+        "thunderd: indexed {} lines for {} (tcp:{port})",
+        state.index.lock().unwrap().line_count(),
+        root.display()
+    );
+
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { continue };
+        let state = state.clone();
+        thread::spawn(move || {
+            let _ = handle_connection_tcp(stream, &state);
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn handle_connection(mut stream: UnixStream, state: &DaemonState) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
@@ -362,6 +526,18 @@ fn handle_connection(mut stream: UnixStream, state: &DaemonState) -> Result<()> 
     Ok(())
 }
 
+#[cfg(not(unix))]
+fn handle_connection_tcp(mut stream: std::net::TcpStream, state: &DaemonState) -> Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let request: ClientRequest = serde_json::from_str(line.trim())?;
+    let response = state.handle_request(request);
+    serde_json::to_writer(&mut stream, &response)?;
+    stream.write_all(b"\n")?;
+    Ok(())
+}
+
 fn spawn_watcher(state: Arc<DaemonState>, root: PathBuf) -> Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher = RecommendedWatcher::new(tx, Config::default()).context("create watcher")?;
@@ -369,9 +545,27 @@ fn spawn_watcher(state: Arc<DaemonState>, root: PathBuf) -> Result<()> {
 
     thread::spawn(move || {
         let _watcher = watcher;
-        while rx.recv().is_ok() {
-            thread::sleep(Duration::from_millis(400));
-            let _ = state.index.lock().unwrap().build();
+        loop {
+            let Ok(Ok(event)) = rx.recv() else {
+                break;
+            };
+
+            let mut pending: HashSet<PathBuf> = event.paths.into_iter().collect();
+            let deadline = Instant::now() + Duration::from_millis(400);
+            while Instant::now() < deadline {
+                let wait = deadline.saturating_duration_since(Instant::now());
+                match rx.recv_timeout(wait) {
+                    Ok(Ok(ev)) => pending.extend(ev.paths),
+                    _ => break,
+                }
+            }
+
+            if !pending.is_empty() {
+                let paths: Vec<PathBuf> = pending.into_iter().collect();
+                if let Ok(mut index) = state.index.lock() {
+                    let _ = index.update_paths(&paths);
+                }
+            }
         }
     });
 
@@ -387,6 +581,7 @@ pub fn client_ping(root: &Path) -> Result<bool> {
             query: None,
             limit: None,
             ignore_case: None,
+            prefix: None,
         },
     ) {
         Ok(resp) => Ok(resp.ok),
@@ -408,12 +603,31 @@ pub fn client_search(
             query: Some(query.to_string()),
             limit: Some(limit),
             ignore_case: Some(ignore_case),
+            prefix: None,
         },
     )?;
     if !resp.ok {
         bail!(resp.message.unwrap_or_else(|| "daemon search failed".into()));
     }
     Ok(resp.matches.unwrap_or_default())
+}
+
+pub fn client_list_files(root: &Path, prefix: Option<&str>, limit: usize) -> Result<Vec<String>> {
+    let resp = client_request(
+        root,
+        ClientRequest {
+            op: "list_files".into(),
+            root: Some(root.to_string_lossy().into_owned()),
+            query: None,
+            limit: Some(limit),
+            ignore_case: None,
+            prefix: prefix.map(str::to_string),
+        },
+    )?;
+    if !resp.ok {
+        bail!(resp.message.unwrap_or_else(|| "list_files failed".into()));
+    }
+    Ok(resp.files.unwrap_or_default())
 }
 
 pub fn client_reindex(root: &Path) -> Result<usize> {
@@ -425,6 +639,7 @@ pub fn client_reindex(root: &Path) -> Result<usize> {
             query: None,
             limit: None,
             ignore_case: None,
+            prefix: None,
         },
     )?;
     if !resp.ok {
@@ -434,16 +649,41 @@ pub fn client_reindex(root: &Path) -> Result<usize> {
 }
 
 fn client_request(root: &Path, request: ClientRequest) -> Result<ClientResponse> {
-    let socket_path = socket_path_for_root(root)?;
-    let mut stream = UnixStream::connect(&socket_path)
-        .with_context(|| format!("connect {}", socket_path.display()))?;
+    #[cfg(unix)]
+    {
+        let socket_path = socket_path_for_root(root)?;
+        if socket_path.exists() {
+            let mut stream = UnixStream::connect(&socket_path)
+                .with_context(|| format!("connect {}", socket_path.display()))?;
+            serde_json::to_writer(&mut stream, &request)?;
+            stream.write_all(b"\n")?;
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line)?;
+            return serde_json::from_str(&line).context("parse daemon response");
+        }
+    }
+    client_request_tcp(root, request)
+}
+
+#[cfg(not(unix))]
+fn client_request_tcp(root: &Path, request: ClientRequest) -> Result<ClientResponse> {
+    use std::net::TcpStream;
+    let port_file = tcp_port_path_for_root(root)?;
+    let port = fs::read_to_string(&port_file)?.trim().parse::<u16>()?;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .context("connect tcp daemon")?;
     serde_json::to_writer(&mut stream, &request)?;
     stream.write_all(b"\n")?;
-
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line)?;
     serde_json::from_str(&line).context("parse daemon response")
+}
+
+#[cfg(unix)]
+fn client_request_tcp(_root: &Path, _request: ClientRequest) -> Result<ClientResponse> {
+    bail!("daemon not running")
 }
 
 pub fn ensure_daemon(root: PathBuf, config: &ThunderConfig) -> Result<()> {
@@ -483,12 +723,19 @@ pub fn ensure_daemon(root: PathBuf, config: &ThunderConfig) -> Result<()> {
 
 pub fn stop_daemon(root: &Path) -> Result<bool> {
     let pid_file = pid_path_for_root(root)?;
-    let socket = socket_path_for_root(root)?;
-
     let stopped = if pid_file.exists() {
-        let pid = fs::read_to_string(&pid_file)?.trim().parse::<i32>().ok();
+        let pid = fs::read_to_string(&pid_file)?.trim().parse::<u32>().ok();
         if let Some(pid) = pid {
-            unsafe { libc::kill(pid, libc::SIGTERM) };
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/F"])
+                    .status();
+            }
             thread::sleep(Duration::from_millis(200));
         }
         true
@@ -497,7 +744,9 @@ pub fn stop_daemon(root: &Path) -> Result<bool> {
     };
 
     fs::remove_file(pid_file).ok();
-    fs::remove_file(socket).ok();
+    #[cfg(unix)]
+    fs::remove_file(socket_path_for_root(root)?).ok();
+    fs::remove_file(tcp_port_path_for_root(root)?).ok();
     Ok(stopped)
 }
 
@@ -511,6 +760,7 @@ pub fn daemon_status(root: &Path) -> Result<DaemonStatus> {
                 query: None,
                 limit: None,
                 ignore_case: None,
+                prefix: None,
             },
         )?;
         return Ok(DaemonStatus {
@@ -532,9 +782,6 @@ pub struct DaemonStatus {
     pub lines_indexed: Option<usize>,
     pub root: Option<String>,
 }
-
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
 pub fn validate_match_path(root: &Path, rel_path: &str) -> Result<PathBuf> {
     let path = PathBuf::from(rel_path);
@@ -574,5 +821,37 @@ mod tests {
         index.build().unwrap();
         let hits = index.search("thunder_search", 10, true);
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn incremental_update_replaces_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("a.txt");
+        fs::File::create(&file)
+            .unwrap()
+            .write_all(b"alpha\n")
+            .unwrap();
+
+        let mut index = SearchIndex::new(temp.path().to_path_buf(), 1024 * 1024);
+        index.build().unwrap();
+        assert_eq!(index.search("alpha", 10, true).len(), 1);
+
+        fs::write(&file, "beta\n").unwrap();
+        index.update_paths(&[file]).unwrap();
+        assert_eq!(index.search("alpha", 10, true).len(), 0);
+        assert_eq!(index.search("beta", 10, true).len(), 1);
+    }
+
+    #[test]
+    fn list_files_returns_indexed_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("one.txt"), "x").unwrap();
+        fs::write(temp.path().join("two.txt"), "y").unwrap();
+
+        let mut index = SearchIndex::new(temp.path().to_path_buf(), 1024 * 1024);
+        index.build().unwrap();
+        let files = index.list_files();
+        assert_eq!(files.len(), 2);
+        assert!(files.contains(&"one.txt".to_string()));
     }
 }

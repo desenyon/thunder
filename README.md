@@ -35,14 +35,43 @@ Thunder replaces the trio of tools you reach for dozens of times a day:
 ## Features
 
 - **Warm index daemon** — sub-millisecond literal search on repeated queries via `thunderd`
+- **Streaming ripgrep search** — regex queries stream into the picker as matches arrive
+- **Parallel index build** — rayon-powered initial indexing for large repos
+- **Memory-mapped line corpus** — line text stored on disk, mmap'd at search time
+- **Query router** — bare `tn <query>` routes to search, files, or history automatically
+- **Git-aware palette** — modified/staged files ranked higher
+- **Project scripts** — `package.json` and Makefile targets in the omni palette
+- **Palette plugins** — shell commands in config emit custom palette entries
+- **Config hot-reload** — edits to `config.toml` picked up without restart
+- **Windows daemon** — TCP transport on Windows (Unix socket on macOS/Linux)
+- **Fix rules crate** — `thunder-fix-rules` isolates native correction rules
+- **Daemon-backed file finder** — `tn fl` lists files from the warm index when available
 - **Ripgrep fallback** — full regex power when the index isn't enough
-- **Embedded skim picker** — fzf-quality TUI, no extra install required
+- **Embedded skim picker** — fzf-quality TUI with a minimal monochrome theme (no clutter)
+- **Smart omni palette** — history, recent files, and project files ranked by frecency
 - **11 native fix rules** — git, sudo, cd, npm, docker, python, cargo, pip, kubectl, brew, man
-- **Omni palette** — files + command history in one searchable view
 - **Per-project daemon** — each repo gets its own socket and index
 - **Trigram-accelerated index** — fast candidate filtering on large codebases
+- **Fuzzy file matching** — subsequence scoring for `tn fl` and palette
 - **Shell integration** — zsh, bash, fish with stderr capture for smart fixes
 - **Security hardened** — preview validation, path sandboxing, dangerous command blocking
+
+### v2.0 theme
+
+Thunder 2.0 ships with a clean monochrome TUI. Configure in `~/.config/thunder/config.toml`:
+
+```toml
+[theme]
+preset = "minimal"   # minimal | bw | dark
+minimal_chrome = true  # hide match-count spinner line
+
+[search]
+streaming = true       # stream ripgrep results into picker
+multi_select = false   # allow selecting multiple search results
+
+[palette]
+plugin_commands = []   # e.g. ["./scripts/my-palette.sh"]
+```
 
 ## Install
 

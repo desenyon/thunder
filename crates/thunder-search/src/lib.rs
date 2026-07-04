@@ -10,6 +10,7 @@ use thunder_index::{client_search, ensure_daemon};
 use thunder_pick::{PickOptions, pick_lines};
 
 pub mod files;
+pub mod stream;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchMatch {
@@ -58,18 +59,15 @@ impl Default for SearchOptions {
 
 impl SearchOptions {
     pub fn from_config(config: ThunderConfig) -> Self {
+        let mut pick = PickOptions::from_config(&config);
+        pick.multi = config.search.multi_select;
         Self {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             paths: Vec::new(),
             case_insensitive: false,
             fixed_strings: false,
             rg_path: None,
-            pick: PickOptions {
-                height: config.pick.height.clone(),
-                reverse: config.pick.reverse,
-                prompt: config.pick.prompt.clone(),
-                ..PickOptions::default()
-            },
+            pick,
             use_fzf: config.pick.use_fzf,
             preview_cmd: Some(resolve_preview(&config)),
             use_daemon: config.search.use_daemon,
@@ -80,6 +78,10 @@ impl SearchOptions {
 }
 
 pub fn search_interactive(query: &str, options: &SearchOptions) -> Result<Vec<SearchMatch>> {
+    if should_stream_ripgrep(query, options) {
+        return stream::search_interactive_streaming(query, options);
+    }
+
     let matches = run_search(query, options)?;
     if matches.is_empty() {
         if !options.json_output {
@@ -139,6 +141,13 @@ pub fn run_search(query: &str, options: &SearchOptions) -> Result<Vec<SearchMatc
     }
 
     run_ripgrep(query, options)
+}
+
+fn should_stream_ripgrep(query: &str, options: &SearchOptions) -> bool {
+    options.config.search.streaming
+        && !options.json_output
+        && !options.use_fzf
+        && !(options.use_daemon && options.config.search.use_daemon && is_literal_query(query, options))
 }
 
 fn is_literal_query(query: &str, options: &SearchOptions) -> bool {
@@ -214,7 +223,7 @@ pub fn run_ripgrep(query: &str, options: &SearchOptions) -> Result<Vec<SearchMat
     Ok(matches)
 }
 
-fn parse_match_line(line: &str) -> Result<Option<SearchMatch>> {
+pub(crate) fn parse_match_line(line: &str) -> Result<Option<SearchMatch>> {
     let event: RgEvent = match serde_json::from_str(line) {
         Ok(event) => event,
         Err(_) => return Ok(None),
@@ -248,7 +257,7 @@ fn map_selected_matches(all: &[SearchMatch], selected: &[String]) -> Vec<SearchM
         .collect()
 }
 
-fn resolve_rg(options: &SearchOptions) -> Result<PathBuf> {
+pub(crate) fn resolve_rg(options: &SearchOptions) -> Result<PathBuf> {
     if let Some(path) = &options.rg_path {
         return Ok(PathBuf::from(path));
     }

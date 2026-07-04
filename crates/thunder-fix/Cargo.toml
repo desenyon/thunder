@@ -9,4 +9,5 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 thunder-core = { path = "../thunder-core" }
+thunder-fix-rules = { path = "../thunder-fix-rules" }
 thiserror.workspace = true

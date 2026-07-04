@@ -1,8 +1,13 @@
 use std::io::{self, BufRead, Cursor, IsTerminal, Read};
 use std::process::Command;
+use std::sync::mpsc::Receiver;
 
 use anyhow::{Context, Result, bail};
 use skim::prelude::*;
+use thunder_core::{resolve_theme_color, ThunderConfig};
+
+mod channel;
+use channel::ChannelReader;
 
 /// How to run the interactive picker.
 #[derive(Debug, Clone)]
@@ -13,6 +18,9 @@ pub struct PickOptions {
     pub preview_cmd: Option<String>,
     pub query: Option<String>,
     pub prompt: String,
+    pub layout: String,
+    pub theme_color: Option<String>,
+    pub minimal_chrome: bool,
 }
 
 impl Default for PickOptions {
@@ -24,8 +32,30 @@ impl Default for PickOptions {
             preview_cmd: None,
             query: None,
             prompt: "> ".to_string(),
+            layout: "default".to_string(),
+            theme_color: None,
+            minimal_chrome: true,
         }
     }
+}
+
+impl PickOptions {
+    pub fn from_config(config: &ThunderConfig) -> Self {
+        Self {
+            height: config.pick.height.clone(),
+            reverse: config.pick.reverse,
+            prompt: config.pick.prompt.clone(),
+            layout: config.pick.layout.clone(),
+            theme_color: Some(resolve_theme_color(config)),
+            minimal_chrome: config.theme.minimal_chrome,
+            ..Self::default()
+        }
+    }
+}
+
+/// Run the picker over items streamed from a channel (e.g. live ripgrep output).
+pub fn pick_from_channel(rx: Receiver<String>, options: &PickOptions) -> Result<Vec<String>> {
+    pick_from_reader(ChannelReader::new(rx), options)
 }
 
 /// Run the picker over newline-delimited items from any reader.
@@ -91,6 +121,14 @@ fn pick_from_stream(stream: SkimItemReceiver, options: &PickOptions) -> Result<V
         builder.preview(preview.clone());
     }
 
+    if let Some(color) = &options.theme_color {
+        builder.color(color.clone());
+    }
+
+    if options.minimal_chrome {
+        builder.no_info(true);
+    }
+
     let skim_options = builder.build().context("invalid skim options")?;
 
     let output = Skim::run_with(skim_options, Some(stream)).map_err(|err| anyhow::anyhow!("{err}"))?;
@@ -107,6 +145,14 @@ fn pick_with_fzf(lines: &[String], options: &PickOptions) -> Result<Vec<String>>
 
     let mut child = Command::new(fzf);
     child.arg("--height").arg(&options.height);
+
+    if options.minimal_chrome {
+        child.arg("--info=hidden");
+    }
+
+    if let Some(color) = &options.theme_color {
+        child.arg("--color").arg(color);
+    }
 
     if options.multi {
         child.arg("--multi");

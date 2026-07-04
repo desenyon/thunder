@@ -3,6 +3,8 @@ use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -21,6 +23,10 @@ pub struct ThunderConfig {
     pub daemon: DaemonConfig,
     #[serde(default)]
     pub history: HistoryConfig,
+    #[serde(default)]
+    pub theme: ThemeConfig,
+    #[serde(default)]
+    pub palette: PaletteConfig,
 }
 
 impl Default for ThunderConfig {
@@ -32,6 +38,63 @@ impl Default for ThunderConfig {
             fix: FixConfig::default(),
             daemon: DaemonConfig::default(),
             history: HistoryConfig::default(),
+            theme: ThemeConfig::default(),
+            palette: PaletteConfig::default(),
+        }
+    }
+}
+
+/// Palette plugin hooks and provider settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaletteConfig {
+    /// Shell commands that emit `label|score|command` lines for the omni palette.
+    #[serde(default)]
+    pub plugin_commands: Vec<String>,
+}
+
+impl Default for PaletteConfig {
+    fn default() -> Self {
+        Self {
+            plugin_commands: Vec::new(),
+        }
+    }
+}
+
+/// TUI color scheme. Defaults to high-contrast monochrome — no purple, no gradients.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThemeConfig {
+    /// skim color string: `bw` = black & white, `minimal` = custom monochrome accent
+    #[serde(default = "default_theme_preset")]
+    pub preset: String,
+    /// Hide match-count / spinner info line in the picker
+    #[serde(default = "default_true")]
+    pub minimal_chrome: bool,
+}
+
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        Self {
+            preset: default_theme_preset(),
+            minimal_chrome: true,
+        }
+    }
+}
+
+fn default_theme_preset() -> String {
+    "minimal".into()
+}
+
+/// Resolve skim `--color` string from theme preset.
+pub fn resolve_theme_color(config: &ThunderConfig) -> String {
+    match config.theme.preset.as_str() {
+        "bw" => "bw".into(),
+        "dark" => "dark".into(),
+        "minimal" | _ => {
+            // Monochrome: white text, dark selection, cyan accent for matches only
+            "fg:252,bg:235,matched:117,matched_bg:235,current:255,current_bg:238,\
+             current_match:117,current_match_bg:238,prompt:252,cursor:255,selected:252,\
+             border:240,header:245,info:240,spinner:240"
+                .into()
         }
     }
 }
@@ -57,6 +120,10 @@ impl Default for GeneralConfig {
 pub struct SearchConfig {
     #[serde(default = "default_true")]
     pub use_daemon: bool,
+    #[serde(default = "default_true")]
+    pub streaming: bool,
+    #[serde(default)]
+    pub multi_select: bool,
     #[serde(default = "default_rg")]
     pub fallback: String,
     #[serde(default = "default_max_file_size")]
@@ -69,6 +136,8 @@ impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             use_daemon: true,
+            streaming: true,
+            multi_select: false,
             fallback: default_rg(),
             max_file_size_bytes: default_max_file_size(),
             max_results: default_max_results(),
@@ -88,6 +157,13 @@ pub struct PickConfig {
     pub reverse: bool,
     #[serde(default = "default_prompt")]
     pub prompt: String,
+    /// Border between list and preview (`default`, `rounded`, `none`)
+    #[serde(default = "default_layout")]
+    pub layout: String,
+}
+
+fn default_layout() -> String {
+    "default".into()
 }
 
 impl Default for PickConfig {
@@ -98,6 +174,7 @@ impl Default for PickConfig {
             use_fzf: false,
             reverse: true,
             prompt: default_prompt(),
+            layout: default_layout(),
         }
     }
 }
@@ -154,6 +231,12 @@ pub struct HistoryConfig {
     pub max_entries: usize,
     #[serde(default = "default_palette_limit")]
     pub palette_limit: usize,
+    #[serde(default = "default_recent_files_limit")]
+    pub recent_files_limit: usize,
+}
+
+fn default_recent_files_limit() -> usize {
+    100
 }
 
 impl Default for HistoryConfig {
@@ -161,6 +244,7 @@ impl Default for HistoryConfig {
         Self {
             max_entries: default_history_max(),
             palette_limit: default_palette_limit(),
+            recent_files_limit: default_recent_files_limit(),
         }
     }
 }
@@ -225,6 +309,70 @@ pub fn stderr_cache_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("last.stderr"))
 }
 
+pub fn recent_files_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("recent.json"))
+}
+
+/// Frecency entry for smart palette ranking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentEntry {
+    pub path: String,
+    pub score: f64,
+    pub last_access: u64,
+}
+
+pub fn record_recent_file(path: &Path, max_entries: usize) -> Result<()> {
+    let path_str = path.to_string_lossy().to_string();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut entries = load_recent_files(max_entries.saturating_mul(2))?;
+    entries.retain(|e| e.path != path_str);
+
+    let boosted = entries
+        .iter()
+        .map(|e| e.score)
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    entries.push(RecentEntry {
+        path: path_str,
+        score: boosted + 1.0,
+        last_access: now,
+    });
+
+    entries.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    entries.truncate(max_entries);
+
+    let dir = data_dir()?;
+    fs::create_dir_all(&dir)?;
+    fs::write(recent_files_path()?, serde_json::to_string_pretty(&entries)?)?;
+    Ok(())
+}
+
+pub fn load_recent_files(limit: usize) -> Result<Vec<RecentEntry>> {
+    let path = recent_files_path()?;
+    let Ok(contents) = fs::read_to_string(path) else {
+        return Ok(Vec::new());
+    };
+    let mut entries: Vec<RecentEntry> = serde_json::from_str(&contents).unwrap_or_default();
+    entries.truncate(limit);
+    Ok(entries)
+}
+
+pub fn recent_score_for(path: &str, entries: &[RecentEntry]) -> f64 {
+    entries
+        .iter()
+        .find(|e| e.path == path || e.path.ends_with(path) || path.ends_with(&e.path))
+        .map(|e| e.score)
+        .unwrap_or(0.0)
+}
+
 fn hash_path(path: &Path) -> Result<String> {
     let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -236,21 +384,42 @@ pub fn socket_path_for_root(root: &Path) -> Result<PathBuf> {
     Ok(data_dir()?.join(format!("thunderd-{}.sock", hash_path(root)?)))
 }
 
+pub fn tcp_port_path_for_root(root: &Path) -> Result<PathBuf> {
+    Ok(data_dir()?.join(format!("thunderd-{}.port", hash_path(root)?)))
+}
+
+pub fn corpus_path_for_root(root: &Path) -> Result<PathBuf> {
+    Ok(data_dir()?.join(format!("thunderd-{}.corpus", hash_path(root)?)))
+}
+
 pub fn pid_path_for_root(root: &Path) -> Result<PathBuf> {
     Ok(data_dir()?.join(format!("thunderd-{}.pid", hash_path(root)?)))
 }
 
 pub fn load_config() -> ThunderConfig {
+    static CACHE: OnceLock<Mutex<(ThunderConfig, Option<SystemTime>)>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new((ThunderConfig::default(), None)));
+
     let path = match config_path() {
         Ok(path) => path,
         Err(_) => return ThunderConfig::default(),
     };
 
+    let mtime = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+    let mut guard = cache.lock().expect("config cache");
+    if guard.1 == mtime {
+        return guard.0.clone();
+    }
+
     let Ok(contents) = fs::read_to_string(path) else {
-        return ThunderConfig::default();
+        guard.0 = ThunderConfig::default();
+        guard.1 = mtime;
+        return guard.0.clone();
     };
 
-    toml::from_str(&contents).unwrap_or_default()
+    guard.0 = toml::from_str(&contents).unwrap_or_default();
+    guard.1 = mtime;
+    guard.0.clone()
 }
 
 pub fn save_config(config: &ThunderConfig) -> Result<()> {
@@ -299,6 +468,7 @@ pub fn resolve_editor(config: &ThunderConfig) -> String {
 }
 
 pub fn open_in_editor(config: &ThunderConfig, path: &Path, line: Option<u64>) -> Result<()> {
+    let _ = record_recent_file(path, config.history.recent_files_limit);
     let editor = resolve_editor(config);
     let mut command = if editor.contains('/') || editor.contains(' ') {
         Command::new("sh")

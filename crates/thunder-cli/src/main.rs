@@ -1,5 +1,8 @@
 mod doctor;
+mod git;
 mod palette;
+mod router;
+mod scripts;
 
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
@@ -16,6 +19,7 @@ use thunder_search::{SearchOptions, search_interactive, search_plain};
 
 use crate::doctor::run_doctor;
 use crate::palette::{print_init_script, run_history, run_palette, write_default_config};
+use crate::router::{QueryRoute, route_query};
 
 const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
@@ -208,13 +212,9 @@ fn main() -> Result<()> {
         }
         Some(Commands::Files { query, open }) => {
             let cwd = std::env::current_dir()?;
-            let pick = PickOptions {
-                height: config.pick.height.clone(),
-                reverse: config.pick.reverse,
-                prompt: "files> ".into(),
-                query: query.clone(),
-                ..PickOptions::default()
-            };
+            let mut pick = PickOptions::from_config(&config);
+            pick.prompt = "files> ".into();
+            pick.query = query.clone();
             let selected = pick_files(&cwd, query.as_deref(), &pick, 1000)?;
             for file in selected {
                 if open || config.general.open_on_select {
@@ -246,21 +246,42 @@ fn main() -> Result<()> {
         }
         None if !cli.query.is_empty() => {
             let query = cli.query.join(" ");
-            run_search_command(
-                &config,
-                query,
-                vec![],
-                false,
-                false,
-                false,
-                false,
-                false,
-                None,
-                None,
-                false,
-                false,
-                false,
-            )?;
+            let cwd = std::env::current_dir()?;
+            match route_query(&query, &cwd, &config) {
+                QueryRoute::Files => {
+                    let mut pick = thunder_pick::PickOptions::from_config(&config);
+                    pick.prompt = "files> ".into();
+                    pick.query = Some(query.clone());
+                    let selected = pick_files(&cwd, Some(&query), &pick, 1000)?;
+                    for file in selected {
+                        if config.general.open_on_select {
+                            open_in_editor(&config, &file.path, None)?;
+                        } else {
+                            println!("{}", file.display);
+                        }
+                    }
+                }
+                QueryRoute::History => {
+                    run_history(&config, Some(&query), false)?;
+                }
+                QueryRoute::Search => {
+                    run_search_command(
+                        &config,
+                        query,
+                        vec![],
+                        false,
+                        false,
+                        false,
+                        false,
+                        config.search.multi_select,
+                        None,
+                        None,
+                        false,
+                        false,
+                        false,
+                    )?;
+                }
+            }
         }
         None => {
             if io::stdin().is_terminal() {
@@ -342,14 +363,10 @@ fn run_pick_command(
     if let Some(preview) = &preview {
         validate_preview_command(preview)?;
     }
-    let options = PickOptions {
-        multi,
-        preview_cmd: preview.or_else(|| options_preview(config)),
-        query,
-        height: config.pick.height.clone(),
-        reverse: config.pick.reverse,
-        prompt: config.pick.prompt.clone(),
-    };
+    let mut options = PickOptions::from_config(config);
+    options.multi = multi;
+    options.preview_cmd = preview.or_else(|| options_preview(config));
+    options.query = query;
 
     let selected = if items.is_empty() {
         pick_stdin(&options)?
