@@ -91,8 +91,10 @@ pub fn search_interactive(query: &str, options: &SearchOptions) -> Result<Vec<Se
     }
 
     if options.json_output {
+        // Machine-readable mode must not continue into the picker or return
+        // matches that callers re-print as path:line text.
         println!("{}", serde_json::to_string(&matches)?);
-        return Ok(matches);
+        return Ok(Vec::new());
     }
 
     let display_lines: Vec<String> = matches.iter().map(SearchMatch::display_line).collect();

@@ -330,7 +330,8 @@ fn run_search_command(
     options.use_daemon = !no_daemon;
     options.json_output = json;
 
-    if no_ui {
+    // --json is for scripting: emit a single JSON document and skip the picker.
+    if no_ui || json {
         search_plain(&query, &options)?;
         return Ok(());
     }

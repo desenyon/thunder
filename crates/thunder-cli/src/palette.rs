@@ -303,7 +303,7 @@ pub fn run_history(config: &ThunderConfig, query: Option<&str>, execute: bool) -
     let cmd = label.trim_start_matches("cmd").trim();
     validate_safe_command(cmd)?;
     if execute {
-        Command::new("sh")
+        let status = Command::new("sh")
             .arg("-c")
             .arg(cmd)
             .stdin(std::process::Stdio::inherit())
@@ -311,6 +311,9 @@ pub fn run_history(config: &ThunderConfig, query: Option<&str>, execute: bool) -
             .stderr(std::process::Stdio::inherit())
             .status()
             .context("failed to run history command")?;
+        if !status.success() {
+            bail!("history command exited with status {status}");
+        }
     } else {
         println!("{cmd}");
     }

@@ -470,24 +470,17 @@ pub fn resolve_editor(config: &ThunderConfig) -> String {
 pub fn open_in_editor(config: &ThunderConfig, path: &Path, line: Option<u64>) -> Result<()> {
     let _ = record_recent_file(path, config.history.recent_files_limit);
     let editor = resolve_editor(config);
-    let mut command = if editor.contains('/') || editor.contains(' ') {
-        Command::new("sh")
-    } else {
-        Command::new(&editor)
-    };
+    let mut parts = editor_argv(&editor)?;
 
-    if editor.contains('/') || editor.contains(' ') {
-        let script = if let Some(line) = line {
-            format!("{editor} +{line} {}", path.display())
-        } else {
-            format!("{editor} {}", path.display())
-        };
-        command.arg("-c").arg(script);
-    } else if let Some(line) = line {
-        command.arg(format!("+{line}")).arg(path);
-    } else {
-        command.arg(path);
+    // Never route the path through a shell — pass argv so metacharacters in
+    // filenames cannot inject commands (e.g. editor = "code --wait").
+    let program = parts.remove(0);
+    let mut command = Command::new(&program);
+    command.args(&parts);
+    if let Some(line) = line {
+        command.arg(format!("+{line}"));
     }
+    command.arg(path);
 
     let status = command
         .status()
@@ -496,6 +489,16 @@ pub fn open_in_editor(config: &ThunderConfig, path: &Path, line: Option<u64>) ->
         bail!("editor exited with status {status}");
     }
     Ok(())
+}
+
+/// Split an editor command into argv without invoking a shell.
+pub fn editor_argv(editor: &str) -> Result<Vec<String>> {
+    let parts = shell_words::split(editor)
+        .with_context(|| format!("failed to parse editor command: {editor}"))?;
+    if parts.is_empty() {
+        bail!("editor command is empty");
+    }
+    Ok(parts)
 }
 
 pub fn resolve_binary(configured: &str, fallbacks: &[&str]) -> Option<PathBuf> {
@@ -617,6 +620,23 @@ mod tests {
     fn rejects_unsafe_preview() {
         assert!(validate_preview_command("cat {1}; rm -rf /").is_err());
         assert!(validate_preview_command("sed -n '{2}p' {1}").is_ok());
+    }
+
+    #[test]
+    fn editor_argv_splits_flags_without_shell() {
+        let parts = editor_argv("code --wait").unwrap();
+        assert_eq!(parts, vec!["code", "--wait"]);
+    }
+
+    #[test]
+    fn editor_argv_preserves_quoted_paths() {
+        let parts = editor_argv(r#""/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" --wait"#)
+            .unwrap();
+        assert_eq!(
+            parts[0],
+            "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
+        );
+        assert_eq!(parts[1], "--wait");
     }
 
     #[test]
