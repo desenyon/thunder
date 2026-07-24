@@ -193,8 +193,11 @@ impl SearchIndex {
             query.to_string()
         };
 
-        let candidate_indices = if needle.len() >= 3 {
-            self.trigram_candidates(&needle)
+        // Trigrams are always indexed from lowercase text, so candidate
+        // filtering must use a lowercase needle even for case-sensitive search.
+        let trigram_needle = query.to_lowercase();
+        let candidate_indices = if trigram_needle.len() >= 3 {
+            self.trigram_candidates(&trigram_needle)
         } else {
             (0..self.lines.len()).collect()
         };
@@ -725,7 +728,9 @@ pub fn stop_daemon(root: &Path) -> Result<bool> {
     let pid_file = pid_path_for_root(root)?;
     let stopped = if pid_file.exists() {
         let pid = fs::read_to_string(&pid_file)?.trim().parse::<u32>().ok();
-        if let Some(pid) = pid {
+        if let Some(pid) = pid
+            && process_looks_like_thunderd(pid)
+        {
             #[cfg(unix)]
             unsafe {
                 libc::kill(pid as i32, libc::SIGTERM);
@@ -748,6 +753,55 @@ pub fn stop_daemon(root: &Path) -> Result<bool> {
     fs::remove_file(socket_path_for_root(root)?).ok();
     fs::remove_file(tcp_port_path_for_root(root)?).ok();
     Ok(stopped)
+}
+
+/// Best-effort check that `pid` is still a thunderd process before signaling it.
+/// Prevents killing an unrelated process after PID reuse of a stale pidfile.
+fn process_looks_like_thunderd(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(comm) = fs::read_to_string(format!("/proc/{pid}/comm")) {
+            return comm.trim() == "thunderd";
+        }
+        if let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) {
+            let text = String::from_utf8_lossy(&cmdline);
+            return text.split('\0').any(|part| {
+                Path::new(part)
+                    .file_name()
+                    .is_some_and(|name| name == "thunderd")
+            });
+        }
+        false
+    }
+    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
+    {
+        let output = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "args="])
+            .output();
+        match output {
+            Ok(out) if out.status.success() => {
+                let args = String::from_utf8_lossy(&out.stdout);
+                args.split_whitespace().any(|part| {
+                    Path::new(part)
+                        .file_name()
+                        .is_some_and(|name| name == "thunderd")
+                })
+            }
+            _ => false,
+        }
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    )))]
+    {
+        let _ = pid;
+        // On unsupported platforms, refuse to signal from a pidfile alone.
+        false
+    }
 }
 
 pub fn daemon_status(root: &Path) -> Result<DaemonStatus> {
@@ -811,6 +865,29 @@ mod tests {
     }
 
     #[test]
+    fn case_sensitive_search_finds_uppercase_needle() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("brand.txt");
+        fs::write(&file, "Hello Thunder rocks\n").unwrap();
+
+        let mut index = SearchIndex::new(temp.path().to_path_buf(), 1024 * 1024);
+        index.build().unwrap();
+
+        let hits = index.search("Thunder", 10, false);
+        assert_eq!(hits.len(), 1, "case-sensitive uppercase query must hit");
+        assert_eq!(hits[0].column, 7);
+
+        let misses = index.search("THUNDER", 10, false);
+        assert!(
+            misses.is_empty(),
+            "case-sensitive search must not match different case"
+        );
+
+        let ignore = index.search("THUNDER", 10, true);
+        assert_eq!(ignore.len(), 1);
+    }
+
+    #[test]
     fn trigram_search_finds_needle() {
         let temp = tempfile::tempdir().unwrap();
         let file = temp.path().join("code.rs");
@@ -840,6 +917,15 @@ mod tests {
         index.update_paths(&[file]).unwrap();
         assert_eq!(index.search("alpha", 10, true).len(), 0);
         assert_eq!(index.search("beta", 10, true).len(), 1);
+    }
+
+    #[test]
+    fn process_identity_rejects_current_pid() {
+        let self_pid = std::process::id();
+        assert!(
+            !process_looks_like_thunderd(self_pid),
+            "test runner must not be treated as thunderd"
+        );
     }
 
     #[test]

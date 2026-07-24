@@ -36,6 +36,17 @@ echo "==> Plain search (ripgrep path)"
 
 echo "==> JSON search output"
 "$TN" s --no-ui --no-daemon --json "SearchOptions" crates | grep -q '"path"'
+# --json must produce a single JSON document even without --no-ui
+json_out="$("$TN" s --json --no-daemon "SearchOptions" crates)"
+echo "$json_out" | grep -q '"path"'
+case "$(printf '%s' "$json_out" | head -c1)" in
+  \[) ;;
+  *) echo "FAIL: expected JSON array from --json without --no-ui"; exit 1 ;;
+esac
+if printf '%s\n' "$json_out" | grep -E '^[A-Za-z0-9_./-]+:[0-9]+$' >/dev/null; then
+  echo "FAIL: path:line contamination after JSON output"
+  exit 1
+fi
 
 echo "==> Index daemon lifecycle"
 pkill -f "$THUNDERD" 2>/dev/null || true
